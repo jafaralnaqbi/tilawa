@@ -358,7 +358,11 @@ footer{text-align:center;font-size:12px;color:var(--muted);padding-top:6px}
 
   /* ---------- الصوت ---------- */
   let ctx = null;
-  const getCtx = () => { if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)(); if (ctx.state==='suspended') ctx.resume(); return ctx; };
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const getCtx = () => { if (!ctx) ctx = new AC(); if (ctx.state==='suspended') ctx.resume(); return ctx; };
+  // فتح الميكروفون قد يغيّر معدل العينات في الجهاز (Safari / سماعات البلوتوث)،
+  // فنغلق المحرك القديم وننشئ واحداً جديداً بعد التسجيل حتى لا يُشغَّل الصوت بسرعة خاطئة
+  async function resetCtx(){ const old = ctx; ctx = null; if (old && old.close){ try { await old.close(); } catch(e){} } }
   const db2g = db => Math.pow(10, db/20);
 
   const irCache = {};
@@ -547,7 +551,7 @@ footer{text-align:center;font-size:12px;color:var(--muted);padding-top:6px}
   /* ---------- مؤشر المستوى ---------- */
   let meterAn = null, meterData = null, meterRaf = 0, peakHold = -60, peakHoldT = 0;
   function meterAttach(node){
-    const c = getCtx(); meterAn = c.createAnalyser(); meterAn.fftSize = 1024; meterData = new Float32Array(meterAn.fftSize);
+    const c = node.context; meterAn = c.createAnalyser(); meterAn.fftSize = 1024; meterData = new Float32Array(meterAn.fftSize);
     node.connect(meterAn); cancelAnimationFrame(meterRaf); meterLoop(); return meterAn;
   }
   function meterDetach(){ cancelAnimationFrame(meterRaf); if (meterAn){ try{ meterAn.disconnect(); }catch(e){} } meterAn = null;
@@ -633,11 +637,11 @@ footer{text-align:center;font-size:12px;color:var(--muted);padding-top:6px}
   $('speed').onchange = () => { if (srcB){ offset = position(); startedAt = ctx.currentTime; srcA.playbackRate.value = srcB.playbackRate.value = rate(); } };
 
   /* ---------- التسجيل ---------- */
-  let rec = null, chunks = [], stream = null, recStart = 0, recTimer = 0, recording = false, micNode = null;
+  let rec = null, chunks = [], stream = null, recStart = 0, recTimer = 0, recording = false, micNode = null, recCtx = null;
   function setStatus(txt, cls, live){ $('recStatus').className = 'status' + (cls ? ' '+cls : ''); $('recStatus').innerHTML = `<span class="dot${live?' on':''}"></span>`; $('recStatus').append(txt); }
 
   $('btnRec').onclick = async () => {
-    const c = getCtx(); stopAll();
+    stopAll();
     if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder){
       setStatus('التسجيل من الميكروفون غير متاح هنا — ارفع ملفاً صوتياً بدلاً منه', 'err'); return; }
     try {
@@ -648,13 +652,20 @@ footer{text-align:center;font-size:12px;color:var(--muted);padding-top:6px}
     rec.onstop = async () => {
       stream.getTracks().forEach(t => t.stop()); clearInterval(recTimer);
       recording = false; if (micNode){ try{ micNode.disconnect(); }catch(e){} micNode = null; } meterDetach();
+      if (recCtx){ try { await recCtx.close(); } catch(e){} recCtx = null; }
       setStatus('جارٍ المعالجة…');
       const blob = new Blob(chunks, {type: rec.mimeType || 'audio/webm'});
+      await resetCtx(); await new Promise(r => setTimeout(r, 350));   // ننتظر عودة الجهاز لمعدله الطبيعي
       try { await loadBlob(blob); await libSave(blob, 'تلاوة ' + nowName()); }
       catch(e){ setStatus('تعذّرت قراءة التسجيل — حاول مرة أخرى', 'err'); }
     };
     recording = true; $('clipTag').hidden = true;
-    micNode = c.createMediaStreamSource(stream); meterAttach(micNode);
+    try {   // محرك مستقل للمؤشر فقط، بمعدل الميكروفون نفسه، ويُغلق بعد التسجيل
+      const sr = stream.getAudioTracks()[0]?.getSettings?.().sampleRate;
+      try { recCtx = sr ? new AC({sampleRate: sr}) : new AC(); } catch(e){ recCtx = new AC(); }
+      if (recCtx.state === 'suspended') recCtx.resume();
+      micNode = recCtx.createMediaStreamSource(stream); meterAttach(micNode);
+    } catch(e){ micNode = null; }   // المؤشر اختياري؛ التسجيل يستمر بدونه
     rec.start(); recStart = Date.now();
     recTimer = setInterval(() => $('recClock').textContent = mmss((Date.now()-recStart)/1000), 250);
     $('btnRec').disabled = true; $('btnRecStop').disabled = false; $('fileIn').disabled = true;
