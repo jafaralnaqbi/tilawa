@@ -536,6 +536,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
   const getCtx = () => { if (!ctx) ctx = new AC(); if (ctx.state==='suspended') ctx.resume(); return ctx; };
   // فتح الميكروفون قد يغيّر معدل العينات (Safari / سماعات البلوتوث)، فنعيد إنشاء المحرك بعد كل التقاط
   async function resetCtx(){ const old = ctx; ctx = null; if (old && old.close){ try { await old.close(); } catch(e){} } }
+  function freshCtx(){ const old = ctx; ctx = null; if (old && old.close){ try { old.close(); } catch(e){} } return getCtx(); }
   const db2g = db => Math.pow(10, db/20);
 
   const irCache = {};
@@ -946,7 +947,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     $('btnExport').disabled = !has || !idle; $('btnShare').disabled = !has || !idle;
     $('btnAutoTrim').disabled = !has; $('btnResetTrim').disabled = !has;
   }
-  $('btnPlay').onclick = () => { if (!prepBuf) return; getCtx(); if (srcB) pause(); else startPlayback(offset >= prepBuf.duration - 0.05 ? 0 : offset); };
+  $('btnPlay').onclick = () => { if (!prepBuf) return; if (srcB){ pause(); return; } freshCtx(); startPlayback(offset >= prepBuf.duration - 0.05 ? 0 : offset); };
   $('btnStop').onclick = stopAll;
   $('segDry').onclick = () => setMode('dry');
   $('segProc').onclick = () => setMode('proc');
@@ -954,7 +955,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
 
   /* ---------- التسجيل ---------- */
   let recState = 'idle';   // idle | arming | count | rec | noise
-  let rec = null, chunks = [], stream = null, recStart = 0, recTimer = 0, micNode = null, recCtx = null, countTimer = 0;
+  let recStopAt = 0, rec = null, chunks = [], stream = null, recStart = 0, recTimer = 0, micNode = null, recCtx = null, countTimer = 0;
   function setStatus(txt, cls){ $('recStatus').className = 'status' + (cls ? ' '+cls : ''); $('recStatus').textContent = txt; }
   function updRecUI(){
     const b = $('btnRec'); b.dataset.state = recState === 'noise' ? 'arming' : recState;
@@ -986,9 +987,11 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     $('clipTag').hidden = true;
     try {   // محرك مستقل بمعدل الميكروفون نفسه، للمؤشر والصدى المسموع، يُغلق بعد التسجيل
       const sr = stream.getAudioTracks()[0]?.getSettings?.().sampleRate;
-      try { recCtx = sr ? new AC({sampleRate: sr, latencyHint: 'interactive'}) : new AC({latencyHint: 'interactive'}); } catch(e){ recCtx = new AC(); }
+      try { recCtx = new AC({latencyHint: 'interactive'}); } catch(e){ recCtx = new AC(); }
       if (recCtx.state === 'suspended') recCtx.resume();
-      micNode = recCtx.createMediaStreamSource(stream); meterAttach(micNode);
+      try { micNode = recCtx.createMediaStreamSource(stream); }
+      catch(e){ try { recCtx.close(); } catch(_){} recCtx = new AC(sr ? {sampleRate: sr} : undefined); if (recCtx.state === 'suspended') recCtx.resume(); micNode = recCtx.createMediaStreamSource(stream); }
+      meterAttach(micNode);
       if ($('optMon').checked) monChain = buildChain(recCtx, micNode, recCtx.destination);
     } catch(e){ micNode = null; monChain = null; }
     if ($('optCount').checked){
@@ -998,7 +1001,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     } else beginRec();
   }
   function cancelRec(){ clearInterval(countTimer); teardownMic(); recState = 'idle'; updRecUI(); setStatus('أُلغي التسجيل'); }
-  function stopRec(){ if (rec && rec.state !== 'inactive') rec.stop(); }
+  function stopRec(){ if (rec && rec.state !== 'inactive'){ recStopAt = Date.now(); rec.stop(); } }
   function beginRec(){
     chunks = [];
     try { rec = new MediaRecorder(stream); } catch(e){ teardownMic(); recState = 'idle'; updRecUI(); setStatus('تعذّر بدء التسجيل في هذا المتصفح', 'err'); return; }
@@ -1009,10 +1012,11 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
       const blob = new Blob(chunks, {type: rec.mimeType || 'audio/webm'});
       await resetCtx(); await new Promise(r => setTimeout(r, 350));
       const name = $('recName').value.trim() || ('تلاوة ' + nowName());
-      try { await loadBlob(blob); $('recName').value = name; updFname(); await libSave(blob, name); }
+      const realDur = ((recStopAt || Date.now()) - recStart) / 1000;
+      try { const fix = await loadBlob(blob, 0, realDur); $('recName').value = name; updFname(); await libSave(blob, name, fix); }
       catch(e){ setStatus('تعذّرت قراءة التسجيل — حاول مرة أخرى', 'err'); }
     };
-    rec.start(); recStart = Date.now(); recState = 'rec'; updRecUI();
+    rec.start(); recStart = Date.now(); recStopAt = 0; recState = 'rec'; updRecUI();
     $('recClock').textContent = '00:00';
     recTimer = setInterval(() => $('recClock').textContent = mmss((Date.now()-recStart)/1000), 250);
     setStatus(monChain ? 'جارٍ التسجيل… تسمع الصدى الآن في السماعة' : 'جارٍ التسجيل… أبقِ الحلقة خضراء أو صفراء');
@@ -1025,16 +1029,38 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     catch(err){ setStatus('تعذّر فتح هذا الملف — جرّب ملفاً بصيغة MP3 أو M4A أو WAV', 'err'); }
     e.target.value = '';
   };
-  async function loadBlob(blob){
+  const STD_SR = [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000];
+  async function resampleAs(buf, trueSr){   // البيانات نفسها لكن بمعدلها الحقيقي، ثم نحوّلها لمعدل المحرك
+    const C = buf.numberOfChannels, n = buf.length, sr = buf.sampleRate;
+    const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const oc = new OAC(C, Math.max(1, Math.ceil(n * sr / trueSr)), sr);
+    const src = oc.createBuffer(C, n, trueSr);
+    for (let c=0;c<C;c++) src.getChannelData(c).set(buf.getChannelData(c));
+    const s = oc.createBufferSource(); s.buffer = src; s.connect(oc.destination); s.start(0);
+    return await oc.startRendering();
+  }
+  async function loadBlob(blob, knownFix, realDur){
     const ab = await blob.arrayBuffer();
-    rawBuf = await decode(ab); bufId++; denCache = null; exportCache = null;
+    let b = await decode(ab), fix = 0, fixedNow = false;
+    if (knownFix) fix = knownFix;
+    else if (realDur > 1.5){
+      const ratio = b.duration / realDur;
+      if (Math.abs(ratio - 1) > 0.15){
+        let t = b.sampleRate * ratio; const near = STD_SR.find(r => Math.abs(r - t) / r < 0.07); if (near) t = near;
+        fix = t / b.sampleRate; fixedNow = true;
+      }
+    }
+    if (fix && Math.abs(fix - 1) > 0.01) b = await resampleAs(b, b.sampleRate * fix); else fix = 0;
+    rawBuf = b; bufId++; denCache = null; exportCache = null;
     trimS = 0; trimE = rawBuf.duration; offset = 0;
     peaks = computePeaks(rawBuf); baseImg = null; $('waveEmpty').hidden = true;
     updTrimInfo(); sizeCanvas();
     await rebuild();
     $('recClock').textContent = mmss(rawBuf.duration);
-    setStatus('جاهز — المدة ' + mmss(rawBuf.duration) + '. استمع، ثم احفظ أو شارك', 'good');
+    setStatus(fixedNow ? 'جاهز — صُحّحت سرعة التسجيل تلقائياً (اختلاف معدل سماعة البلوتوث). المدة ' + mmss(rawBuf.duration)
+                       : 'جاهز — المدة ' + mmss(rawBuf.duration) + '. استمع، ثم احفظ أو شارك', 'good');
     updTime(); setPlayButtons(); updNrUI();
+    return fix;
   }
 
   /* ---------- اسم التسجيل ---------- */
@@ -1088,7 +1114,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
   }
   function encodeRealtime(buf, mime){
     return new Promise((res, rej) => {
-      const c = getCtx(), dest = c.createMediaStreamDestination(), s = c.createBufferSource();
+      const c = freshCtx(), dest = c.createMediaStreamDestination(), s = c.createBufferSource();
       s.buffer = buf; s.connect(dest);
       const r = new MediaRecorder(dest.stream, {mimeType:mime, audioBitsPerSecond:192000}), parts = [];
       r.ondataavailable = e => { if (e.data.size) parts.push(e.data); };
@@ -1178,10 +1204,10 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
   const reqP = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
   const txDone = tx => new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = () => rej(tx.error); tx.onabort = () => rej(tx.error); });
   function libErr(t){ $('libStatus').className = 'status err'; $('libStatus').textContent = t; }
-  async function libSave(blob, name){
+  async function libSave(blob, name, fix){
     try {
       const d = await openDB(), tx = d.transaction(['meta','blobs'], 'readwrite');
-      const id = await reqP(tx.objectStore('meta').add({name, date: Date.now(), dur: rawBuf ? rawBuf.duration : 0, size: blob.size}));
+      const id = await reqP(tx.objectStore('meta').add({name, date: Date.now(), dur: rawBuf ? rawBuf.duration : 0, size: blob.size, fix: fix || 0}));
       tx.objectStore('blobs').put({id, blob}); await txDone(tx);
       currentId = id; libRender();
       try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch(e){}
@@ -1231,7 +1257,7 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     try {
       const d = await openDB(), r = await reqP(d.transaction('blobs').objectStore('blobs').get(id)), m = await reqP(d.transaction('meta').objectStore('meta').get(id));
       if (!r) throw 0; stopAll(); setStatus('جارٍ فتح التسجيل…');
-      await loadBlob(r.blob); currentId = id; $('recName').value = m ? m.name : ''; updFname(); libRender();
+      await loadBlob(r.blob, m && m.fix ? m.fix : 0); currentId = id; $('recName').value = m ? m.name : ''; updFname(); libRender();
       window.scrollTo({top:0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth'});
     } catch(e){ libErr('تعذّر فتح هذا التسجيل.'); }
   }
