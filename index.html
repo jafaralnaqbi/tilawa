@@ -970,11 +970,53 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     const c = getCtx();
     return await new Promise((res, rej) => { const p = c.decodeAudioData(ab, res, rej); if (p && p.then) p.then(res, rej); });
   }
-  function teardownMic(){
-    if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
+  // محرك الميكروفون (للمؤشر والصدى المسموع). سماعات البلوتوث تغيّر معدلها بعد فتح الميكروفون،
+  // فنراقب ساعة المحرك مقابل الساعة الحقيقية، وإذا اختلفتا نعيد بناءه بمعدل الجهاز الجديد.
+  let driftTimer = 0, driftRef = null, rebuilds = 0, driftHits = 0;
+  function dropRecGraph(){
     if (micNode){ try { micNode.disconnect(); } catch(e){} micNode = null; }
     monChain = null; meterDetach();
     if (recCtx){ const c = recCtx; recCtx = null; try { c.close(); } catch(e){} }
+  }
+  function buildRecGraph(){
+    dropRecGraph(); if (!stream) return;
+    try {
+      try { recCtx = new AC({latencyHint: 'interactive'}); } catch(e){ recCtx = new AC(); }
+      if (recCtx.state === 'suspended') recCtx.resume();
+      try { micNode = recCtx.createMediaStreamSource(stream); }
+      catch(e){
+        const sr = stream.getAudioTracks()[0]?.getSettings?.().sampleRate;
+        try { recCtx.close(); } catch(_){} recCtx = new AC(sr ? {sampleRate: sr} : undefined);
+        if (recCtx.state === 'suspended') recCtx.resume(); micNode = recCtx.createMediaStreamSource(stream);
+      }
+      meterAttach(micNode);
+      if ($('optMon').checked) monChain = buildChain(recCtx, micNode, recCtx.destination);
+    } catch(e){ micNode = null; monChain = null; }
+    driftRef = null;
+  }
+  function startDriftWatch(){
+    clearInterval(driftTimer); rebuilds = 0; driftHits = 0; driftRef = null;
+    driftTimer = setInterval(() => {
+      if (!recCtx || recCtx.state !== 'running'){ driftRef = null; return; }
+      const now = {c: recCtx.currentTime, w: performance.now()};
+      if (driftRef && driftRef.ctx === recCtx){
+        const dw = (now.w - driftRef.w) / 1000, ratio = (now.c - driftRef.c) / dw;
+        // اختلاف معدل البلوتوث كبير (×1.5 إلى ×3)، فنشترط فرقاً واضحاً في قراءتين متتاليتين لتجنّب الإنذار الكاذب
+        const off = dw > 0.6 && Math.abs(ratio - 1) > 0.2; driftHits = off ? driftHits + 1 : 0;
+        if (driftHits >= 2){
+          driftHits = 0;
+          if (rebuilds < 4){ rebuilds++; buildRecGraph(); return; }
+          if (monChain){ monChain = null; buildRecGraph(); $('optMon').checked = false; $('monNote').hidden = true;
+            setStatus('أُوقف سماع الصدى لأن السماعة لا تستقر على معدل ثابت — التسجيل مستمر بشكل سليم'); }
+        }
+      }
+      driftRef = {ctx: recCtx, c: now.c, w: now.w};
+    }, 900);
+  }
+  function teardownMic(){
+    clearInterval(driftTimer); driftRef = null;
+    dropRecGraph();
+    if (stream){ stream.getTracks().forEach(t => t.stop()); stream = null; }
   }
   $('btnRec').onclick = () => { if (recState === 'idle') startRec(); else if (recState === 'count') cancelRec(); else if (recState === 'rec') stopRec(); };
   async function startRec(){
@@ -985,15 +1027,10 @@ footer{text-align:center;font-size:12.5px;color:var(--muted);padding-top:4px;dis
     try { stream = await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}}); }
     catch(e){ recState = 'idle'; updRecUI(); setStatus('تعذّر الوصول إلى الميكروفون — اسمح بالوصول من إعدادات المتصفح، أو ارفع ملفاً صوتياً', 'err'); return; }
     $('clipTag').hidden = true;
-    try {   // محرك مستقل بمعدل الميكروفون نفسه، للمؤشر والصدى المسموع، يُغلق بعد التسجيل
-      const sr = stream.getAudioTracks()[0]?.getSettings?.().sampleRate;
-      try { recCtx = new AC({latencyHint: 'interactive'}); } catch(e){ recCtx = new AC(); }
-      if (recCtx.state === 'suspended') recCtx.resume();
-      try { micNode = recCtx.createMediaStreamSource(stream); }
-      catch(e){ try { recCtx.close(); } catch(_){} recCtx = new AC(sr ? {sampleRate: sr} : undefined); if (recCtx.state === 'suspended') recCtx.resume(); micNode = recCtx.createMediaStreamSource(stream); }
-      meterAttach(micNode);
-      if ($('optMon').checked) monChain = buildChain(recCtx, micNode, recCtx.destination);
-    } catch(e){ micNode = null; monChain = null; }
+    // ننتظر لحظة حتى تنتقل سماعة البلوتوث إلى وضع الميكروفون قبل بناء المحرك
+    await new Promise(r => setTimeout(r, 600));
+    if (!stream) return;
+    buildRecGraph(); startDriftWatch();
     if ($('optCount').checked){
       recState = 'count'; updRecUI(); let n = 3;
       $('countNum').textContent = n; setStatus('استعدّ… يبدأ التسجيل بعد العدّ');
