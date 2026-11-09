@@ -1,0 +1,17 @@
+{
+  "name": "محسّن صوت التلاوة",
+  "short_name": "التلاوة",
+  "description": "سجّل تلاوتك، ونقِّها من الضجيج، وأضف إليها صدى المسجد — كل المعالجة على جهازك.",
+  "lang": "ar",
+  "dir": "rtl",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#14514A",
+  "theme_color": "#14514A",
+  "icons": [
+    {"src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any"},
+    {"src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any"},
+    {"src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}
+  ]
+}
